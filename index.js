@@ -1,6 +1,7 @@
 import http from 'node:http';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
+import { GoogleGenAI } from '@google/genai';
 import {
   TikTokLiveConnection,
   WebcastEvent,
@@ -10,8 +11,13 @@ import {
 
 const PORT = Number(process.env.PORT) || 3000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const AI_COOLDOWN_MS = 5_000;
 const USERNAME_REGEX = /^[a-zA-Z0-9._]{2,24}$/;
 const startedAt = Date.now();
+
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim();
+const geminiClient = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
 /**
  * Structured logger with ISO timestamp and channel tag.
@@ -82,13 +88,84 @@ function isOfflineError(err) {
 }
 
 /**
+ * Creates a bounded sliding-window buffer for real-time PK tactical context.
+ */
+function createPkBuffer() {
+  return {
+    totalDiamonds: 0,
+    totalGifts: 0,
+    totalLikes: 0,
+    totalFollows: 0,
+    topGifters: new Map(),
+    recentChats: [],
+    recentGifts: [],
+    lastAiAt: 0
+  };
+}
+
+/**
+ * Formats a session's PK buffer into a compact summary for Gemini.
+ * @param {ReturnType<typeof createPkBuffer>} buf
+ */
+function buildPkMetrics(buf) {
+  const topGifters = Array.from(buf.topGifters.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([username, diamonds]) => ({ username, diamonds }));
+
+  return {
+    totalDiamonds: buf.totalDiamonds,
+    totalGifts: buf.totalGifts,
+    totalLikes: buf.totalLikes,
+    totalFollows: buf.totalFollows,
+    topGifters,
+    recentChats: buf.recentChats.slice(-15),
+    recentGifts: buf.recentGifts.slice(-10)
+  };
+}
+
+/**
+ * Calls Gemini 2.5 Flash to produce concise tactical PK guidance in Spanish.
+ * @param {{ username: string, metrics?: object, customPrompt?: string }} params
+ */
+async function analyzeWithGemini({ username, metrics, customPrompt }) {
+  if (!geminiClient) {
+    const err = new Error('GEMINI_API_KEY no esta configurada en las variables de entorno de Render.');
+    err.code = 'AI_NOT_CONFIGURED';
+    throw err;
+  }
+
+  const userPrompt = [
+    `Streamer: @${username || 'desconocido'}`,
+    metrics ? `Metricas reales actuales: ${JSON.stringify(metrics)}` : null,
+    customPrompt ? `Solicitud especifica: ${customPrompt}` : 'Dame un resumen tactico breve: a quien agradecer, como esta el ritmo del PK y que llamado a la accion hacer ahora.'
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const response = await geminiClient.models.generateContent({
+    model: GEMINI_MODEL,
+    contents: userPrompt,
+    config: {
+      systemInstruction:
+        'Eres el copiloto tactico en tiempo real de APEX PK para transmisiones de TikTok LIVE. Responde en espanol claro, directo y accionable en maximo 4 viñetas cortas.',
+      temperature: 0.4,
+      maxOutputTokens: 300
+    }
+  });
+
+  return (response?.text || '').trim();
+}
+
+/**
  * Active sessions tracked by socket id for status reporting and cleanup.
- * @type {Map<WebSocket, { username: string, connectedAt: number, roomId: string | null, tiktok: TikTokLiveConnection | null }>}
+ * @type {Map<WebSocket, { username: string, connectedAt: number, roomId: string | null, isConnecting: boolean, pkBuffer: ReturnType<typeof createPkBuffer>, tiktok: TikTokLiveConnection | null }>}
  */
 const activeSessions = new Map();
 
 const app = express();
 app.disable('x-powered-by');
+app.use(express.json({ limit: '64kb' }));
 
 app.use((req, res, next) => {
   res.on('finish', () => {
@@ -103,6 +180,7 @@ app.get('/health', (_req, res) => {
   res.status(200).json({
     status: 'ok',
     service: 'apex-pk-bridge',
+    aiEnabled: Boolean(geminiClient),
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     timestamp: Date.now()
   });
@@ -122,12 +200,57 @@ app.get('/status', (_req, res) => {
   res.status(200).json({
     status: 'ok',
     service: 'apex-pk-bridge',
+    aiEnabled: Boolean(geminiClient),
+    aiModel: geminiClient ? GEMINI_MODEL : null,
     activeSockets: activeSessions.size,
     sessions,
     uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
     memoryRssMb: Math.round((mem.rss / 1024 / 1024) * 10) / 10,
     timestamp: Date.now()
   });
+});
+
+app.post('/ai/analyze', async (req, res) => {
+  if (!geminiClient) {
+    res.status(503).json({
+      ok: false,
+      reason: 'GEMINI_API_KEY no esta configurada en el servidor.',
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  const username = normalizeUsername(req.body?.username) || 'streamer';
+  const customPrompt = typeof req.body?.prompt === 'string' ? req.body.prompt.slice(0, 400) : '';
+  let metrics = req.body?.context && typeof req.body.context === 'object' ? req.body.context : null;
+
+  if (!metrics) {
+    for (const session of activeSessions.values()) {
+      if (session.username === username) {
+        metrics = buildPkMetrics(session.pkBuffer);
+        break;
+      }
+    }
+  }
+
+  try {
+    const analysis = await analyzeWithGemini({ username, metrics, customPrompt });
+    log('AI', `Analisis HTTP completado para @${username}`);
+    res.status(200).json({
+      ok: true,
+      username,
+      model: GEMINI_MODEL,
+      analysis,
+      timestamp: Date.now()
+    });
+  } catch (err) {
+    log('AI', `Error en analisis HTTP para @${username}: ${err?.message || err}`);
+    res.status(502).json({
+      ok: false,
+      reason: err?.message || 'Error al consultar Gemini.',
+      timestamp: Date.now()
+    });
+  }
 });
 
 app.get('/', (req, res) => {
@@ -274,8 +397,8 @@ app.get('/', (req, res) => {
         <div class="metric-value">${uptimeSeconds}s</div>
       </div>
       <div class="metric">
-        <div class="metric-label">Canal WS</div>
-        <div class="metric-value">/live</div>
+        <div class="metric-label">Gemini AI</div>
+        <div class="metric-value">${geminiClient ? 'ACTIVO' : 'SIN KEY'}</div>
       </div>
     </section>
     <div class="section-title">Endpoint WebSocket</div>
@@ -283,6 +406,7 @@ app.get('/', (req, res) => {
     <div class="endpoints">
       <span>GET /health</span>
       <span>GET /status</span>
+      <span>POST /ai/analyze</span>
       <span>WS /live?username=&lt;tiktok_username&gt;</span>
     </div>
   </main>
@@ -363,6 +487,7 @@ wss.on('connection', (ws, _request, url) => {
     connectedAt: Date.now(),
     roomId: null,
     isConnecting: true,
+    pkBuffer: createPkBuffer(),
     tiktok: null
   };
   activeSessions.set(ws, session);
@@ -442,11 +567,16 @@ wss.on('connection', (ws, _request, url) => {
 
   tiktok.on(WebcastEvent.CHAT, (data) => {
     const user = extractUser(data);
+    const comment = data?.comment || '';
+    session.pkBuffer.recentChats.push({ username: user.username, comment });
+    if (session.pkBuffer.recentChats.length > 25) {
+      session.pkBuffer.recentChats.shift();
+    }
     sendJson(ws, {
       type: 'chat',
       username: user.username,
       nickname: user.nickname,
-      comment: data?.comment || '',
+      comment,
       timestamp: Date.now()
     });
   });
@@ -469,6 +599,25 @@ wss.on('connection', (ws, _request, url) => {
     const repeatEnd = Boolean(data?.repeatEnd);
     const isStreakActive = giftType === 1 && !repeatEnd;
 
+    if (!isStreakActive) {
+      const earned = diamondCount * repeatCount;
+      session.pkBuffer.totalGifts += repeatCount;
+      session.pkBuffer.totalDiamonds += earned;
+      session.pkBuffer.topGifters.set(
+        user.username,
+        (session.pkBuffer.topGifters.get(user.username) || 0) + earned
+      );
+      session.pkBuffer.recentGifts.push({
+        username: user.username,
+        giftName,
+        diamondCount,
+        repeatCount
+      });
+      if (session.pkBuffer.recentGifts.length > 15) {
+        session.pkBuffer.recentGifts.shift();
+      }
+    }
+
     sendJson(ws, {
       type: 'gift',
       username: user.username,
@@ -485,11 +634,13 @@ wss.on('connection', (ws, _request, url) => {
 
   tiktok.on(WebcastEvent.LIKE, (data) => {
     const user = extractUser(data);
+    const likeCount = Number(data?.likeCount ?? 1);
+    session.pkBuffer.totalLikes += likeCount;
     sendJson(ws, {
       type: 'like',
       username: user.username,
       nickname: user.nickname,
-      likeCount: Number(data?.likeCount ?? 1),
+      likeCount,
       totalLikeCount: Number(data?.totalLikeCount ?? 0),
       timestamp: Date.now()
     });
@@ -497,12 +648,62 @@ wss.on('connection', (ws, _request, url) => {
 
   tiktok.on(WebcastEvent.FOLLOW, (data) => {
     const user = extractUser(data);
+    session.pkBuffer.totalFollows += 1;
     sendJson(ws, {
       type: 'follow',
       username: user.username,
       nickname: user.nickname,
       timestamp: Date.now()
     });
+  });
+
+  ws.on('message', async (rawMessage) => {
+    let payload;
+    try {
+      payload = JSON.parse(rawMessage.toString());
+    } catch {
+      return;
+    }
+
+    if (payload?.type !== 'ai_analyze') {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - session.pkBuffer.lastAiAt < AI_COOLDOWN_MS) {
+      sendJson(ws, {
+        type: 'ai_error',
+        username,
+        reason: 'Espera unos segundos antes de solicitar otro analisis tactico.',
+        timestamp: now
+      });
+      return;
+    }
+
+    session.pkBuffer.lastAiAt = now;
+    const metrics = buildPkMetrics(session.pkBuffer);
+    const customPrompt = typeof payload?.prompt === 'string' ? payload.prompt.slice(0, 400) : '';
+
+    try {
+      const analysis = await analyzeWithGemini({ username, metrics, customPrompt });
+      log('AI', `Analisis WS enviado para @${username}`);
+      sendJson(ws, {
+        type: 'ai_analysis',
+        username,
+        model: GEMINI_MODEL,
+        analysis,
+        metrics,
+        timestamp: Date.now()
+      });
+    } catch (err) {
+      log('AI', `Error en analisis WS para @${username}: ${err?.message || err}`);
+      sendJson(ws, {
+        type: 'ai_error',
+        username,
+        reason: err?.message || 'Error al consultar Gemini.',
+        timestamp: Date.now()
+      });
+    }
   });
 
   ws.on('close', () => {

@@ -6,8 +6,9 @@ Micro-servidor puente en Node.js dedicado exclusivamente a conectar un `@usuario
 
 - `GET /` — Panel de estado operativo en tiempo real.
 - `GET /health` — Verificación rápida de salud para Render (`200 OK`).
-- `GET /status` — Métricas de sockets activos, sesiones y memoria.
-- `WS /live?username=<tiktok_username>` — Canal WebSocket de eventos normalizados.
+- `GET /status` — Métricas de sockets activos, sesiones, estado de Gemini AI y memoria.
+- `POST /ai/analyze` — Análisis táctico PK bajo demanda con **Gemini 2.5 Flash** (`GEMINI_API_KEY`).
+- `WS /live?username=<tiktok_username>` — Canal WebSocket de eventos normalizados (soporta mensajes entrantes `{"type":"ai_analyze"}`).
 
 ## Despliegue en Render (4 pasos)
 
@@ -31,6 +32,7 @@ git push -u origin main
    - **Build Command:** `npm install`
    - **Start Command:** `npm start`
    - **Health Check Path:** `/health`
+   - **Environment Variables:** agrega `GEMINI_API_KEY` con tu clave de Google AI Studio (opcional: `GEMINI_MODEL`, por defecto `gemini-2.5-flash`).
 
 ### 3. Obtener la URL `wss://`
 Una vez que el despliegue marque **Live**, Render te asignará una URL HTTPS pública, por ejemplo:
