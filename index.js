@@ -11,9 +11,13 @@ import {
 
 const PORT = Number(process.env.PORT) || 3000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
+const KEEP_ALIVE_INTERVAL_MS = 10 * 60 * 1000; // 10 min (Render Free duerme a los 15 min)
 const AI_COOLDOWN_MS = 5_000;
 const USERNAME_REGEX = /^[a-zA-Z0-9._]{2,24}$/;
 const startedAt = Date.now();
+
+const KEEP_ALIVE_URL = (process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+const KEEP_ALIVE_ENABLED = process.env.KEEP_ALIVE !== 'false' && Boolean(KEEP_ALIVE_URL);
 
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite').trim();
@@ -762,6 +766,19 @@ const heartbeatTimer = setInterval(() => {
 
 heartbeatTimer.unref();
 
+let keepAliveTimer = null;
+if (KEEP_ALIVE_ENABLED) {
+  keepAliveTimer = setInterval(async () => {
+    try {
+      const res = await fetch(`${KEEP_ALIVE_URL}/health`, { signal: AbortSignal.timeout(8000) });
+      log('SYS', `Keep-alive ping -> ${res.status}`);
+    } catch (err) {
+      log('SYS', `Keep-alive ping fallo: ${err?.message || err}`);
+    }
+  }, KEEP_ALIVE_INTERVAL_MS);
+  keepAliveTimer.unref();
+}
+
 process.on('unhandledRejection', (reason) => {
   log('SYS', `Promesa no capturada: ${reason?.stack || reason}`);
 });
@@ -773,6 +790,9 @@ process.on('uncaughtException', (err) => {
 function shutdown(signal) {
   log('SYS', `Senal ${signal} recibida. Cerrando sesiones activas...`);
   clearInterval(heartbeatTimer);
+  if (keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+  }
 
   for (const ws of Array.from(activeSessions.keys())) {
     cleanupSession(ws);
